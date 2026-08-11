@@ -1,0 +1,2420 @@
+<?xml version='1.0' encoding='utf-8'?>
+<model version="NetLogo 7.0.3" snapToGrid="true">
+  <code>breed [sheep a-sheep] ; sheep agents
+breed [dogs a-dog] ; herding dog agents
+breed [centroids a-centroid] ; only visual marker for flock center
+
+globals [phase done? ticks-to-success holding-start-tick sheep-captured gate-x gate-min-y gate-max-y spreadness-sum spreadness-count] 
+
+sheep-own [speed state prev-x prev-y stuck-counter gradient-diff] ; individual sheep properties
+dogs-own [mode target-sheep dist-traveled prev-x prev-y stuck-counter patrol-angle] ; individual dog properties
+
+; REPORTERS 
+to-report containment-radius
+  let r-raw 2.5 * sqrt nb-sheep ; radius proportional to flock size
+  let r-max min list (max-pxcor - 8) (max-pycor - 8) ; cap: don't exceed world bounds - 8
+  let r-min 23 ;  floor: minimum radius to avoid too small 
+  report max list r-min (min list r-raw r-max) ; clamp between r-min and r-max
+end
+to-report containment-center-x report 0 end ; x coordinate of target zone
+to-report containment-center-y report 0 end ; y coordinate of target zone
+to-report gate-half-size report 3 end ; half width of exit gate
+to-report holding-duration report 800 end ; containment time
+  
+; sheeps behavior
+to-report R-fleeing-dog report 14 end ; radius where sheep flee from dogs
+; to-report R-repulsion report 2 end ; personal space between sheep
+to-report R-vigilance report R-fleeing-dog * 1.8 end ; wider radius for fear contagion
+to-report speed-fleeing report 0.3 end ; speed when scared
+to-report speed-grazing report 0.01 end ; v slow speed when calm
+to-report stress-repulsion-mult report 0.5 end ; repulsion is less when stressed
+;to-report max-turn report 15 end ; max degrees per tick
+to-report max-turn report 40 end ; max degrees per tick
+;to-report n-topological report 7 end ; number of neighbors to consider
+to-report fear-contagion-threshold report 0.3 end ; proportion of fleeing neighbors to trigger panic
+to-report sheep-stuck-threshold report 0.2 end ; min distance to not be stuck
+to-report sheep-stuck-ticks report 15 end ; ticks before unstuck behavior
+
+; sheep force weights
+to-report W-flee-strength report 3.5 end ; flee force from dogs ++
+;to-report W-neigh-fleeing-cohesion report 2 end ; attraction to nearby neighbors
+;to-report W-neigh-grazing-cohesion report 0.5 end ; weak cohesion when grazing
+;to-report W-global-cohesion report 1.5 end ; attraction to flock center
+to-report W-sheep-repulsion report 1.5 end ; avoid crowding
+to-report W-flee-near-gate report 0.5 end ; reduced flee near exit
+to-report W-alignment report 0.3 end ; match neighbor headings when grazing only
+to-report grazing-persistence report 0.5 end ; keep same direction when grazing only
+
+; density gradient parameters
+to-report nb-sectors report 8 end ; number of angular sectors for density scan
+;to-report vision-range report R-vigilance end ; how far sheep can perceive density
+
+; dog behavior
+to-report dog-speed report 1.0 end ; movement speed
+to-report dog-behind-distance report 9 end ; distance behind flock
+to-report dog-push-distance report 9 end ; distance for pushing
+to-report dog-formation-spread report 90 end ; spacing between multiple dogs
+to-report dog-patrol-radius
+  ifelse containment-radius &lt; 25  
+    [ report containment-radius + 8 ] ; bigger when containment is small 
+    [ report containment-radius + 5 ] ; to avoid scaring sheep
+end
+to-report R-repulsion-dogs report 5 end ; dog-dog avoidance radius
+to-report dog-repulsion-weight report 0.8 end ; strength of dog repulsion
+to-report dog-stuck-threshold report 0.3 end ; min distance for stuck detection
+to-report dog-stuck-ticks report 25 end ; ticks before unstuck
+to-report dog-approach-curve-radius report 25 end ; radius for curved approach
+to-report dog-approach-curve-strength report 9.0 end ; strength of curve
+to-report dog-proximity-slowdown report 2.5 end ; slowdown factor near sheep
+to-report dog-retreat-distance report 10 end ; backup distance when too close
+to-report flock-fragmentation-threshold report 0.1 end ; threshold for split flock
+
+; wall avoidance
+to-report wall-avoidance-radius report 8 end ; distance from walls to avoid (sheep)
+to-report wall-avoidance-strength report 5 end ; force strength (sheep)
+
+; thresholds
+to-report lost-threshold report 4 * sqrt sqrt count sheep end ; distance to be lost
+to-report levy-step [min-step max-step] report min list max-step (min-step * exp random-float 5) end ; levy walk step
+  ; check if in zone :
+to-report in-containment-zone? report distancexy containment-center-x containment-center-y &lt;= containment-radius end 
+
+
+  
+to-report mean-spreadness
+  if spreadness-count = 0 [report 0]
+  report spreadness-sum / spreadness-count
+end
+  
+; SETUP 
+to setup
+  clear-all ; reset everything
+  ; initialize globals
+  set done? false  set ticks-to-success -1  set holding-start-tick -1  set sheep-captured 0  set phase "collecting" 
+  ; position gate at right edge
+  set gate-x max-pxcor  set gate-min-y (- gate-half-size)  set gate-max-y gate-half-size 
+  create-dogs nb-dogs [setup-one-dog] ; spawn dogs
+  create-sheep nb-sheep [setup-one-sheep] ; spawn sheep
+  setup-patches ; draw zones
+  create-centroids 1 [set shape "star" set color yellow set size 1 hide-turtle] ; create flock marker
+  set spreadness-sum 0
+  set spreadness-count 0
+  ; GRADIENT LOGGING: open CSV and write header ===
+  ; format: one row per tick, one column per sheep (wide format)
+  ; each cell contains the angular difference between the gradient direction
+  ; and the true GCM direction for that sheep at that tick (degrees, [-180, 180])
+  ; sheep that are grazing or have no visible sector get 0
+  file-open (word "gradient_D" nb-dogs "_N" nb-sheep ".csv")
+  let header "tick"
+  foreach sort sheep [s -&gt;
+    set header (word header ",sheep_" [who] of s)
+  ]
+  file-print header
+
+  reset-ticks ; start time
+end
+
+to setup-one-sheep
+  set color white  set shape "sheep"  set size 1  set heading random 360 ; appearance and direction
+  set speed speed-grazing  set state "grazing"  set stuck-counter 0 ; initial behavior state
+  place-anywhere ; spawn 
+  set prev-x xcor  set prev-y ycor ; store position for stuck check
+end
+
+to place-anywhere
+  let valid? false
+  while [not valid?] [ 
+    let try-x (min-pxcor + 2 + random (world-width - 4)) ; random x with buffer
+    let try-y (min-pycor + 2 + random (world-height - 4)) ; random y with buffer
+    setxy try-x try-y ; place sheep at position
+    set valid? (not any? dogs in-radius 5) ; ensure no dog nearby
+  ]
+end
+
+to setup-one-dog
+  ; get dog index ; column : 0, 1, 2 ; line: 0, 0, 0, 1, 1, 1,
+  let i (who - min [who] of dogs) ; dog index starting from 0
+  setxy (min-pxcor + 5 + (i mod 3) * 3) (max-pycor - 5 - floor (i / 3) * 3) ; grid position
+  set color brown  set shape "wolf"  set size 1.6  set heading random 360 ; appearance
+  set mode "collecting"  set target-sheep nobody  set dist-traveled 0 ; initial phase
+  ; space patrol angles
+  set prev-x xcor  set prev-y ycor  set stuck-counter 0  set patrol-angle (360 * i / nb-dogs) 
+end
+
+to setup-patches
+  ask patches [set pcolor 52] ; base color green for grass
+  ask patches [ ; draw containment boundary
+    let d distancexy containment-center-x containment-center-y ; distance from center
+    if d &lt;= containment-radius and d &gt; containment-radius - 0.5 [set pcolor 55] ; ring for boundary
+  ]
+  ask patch containment-center-x containment-center-y [set pcolor red] ; mark center
+  if with-exit? [ ; if exit phase enabled
+    ask patches with [pxcor = max-pxcor] [ ; right edge
+      ; gate opening vs wall
+      ifelse (pycor &gt;= gate-min-y and pycor &lt;= gate-max-y) [set pcolor 55] [set pcolor gray] 
+    ]
+  ]
+end
+
+; MAIN LOOP
+to go
+  ; === GRADIENT LOGGING: safely close CSV on completion or timeout ===
+  ; carefully avoids errors if file was already closed or never opened
+  if done? or ticks &gt;= 10000 [carefully [file-close] [] stop]
+  if not any? sheep [check-success stop] ; check if all sheep gone
+  update-phase ; manage phase transitions
+  ask dogs [move-dog] ; dogs move first
+  ask sheep [move-sheep] ; then sheep react
+
+  ; === GRADIENT LOGGING: write one row per tick ===
+  ; Only log during collecting/holding — during exiting, sheep die
+  ; and the column count would change, breaking the CSV format
+  if phase != "exiting" [
+    let row (word ticks)
+    foreach sort sheep [s -&gt;
+      ifelse [state] of s = "fleeing" and [gradient-diff] of s != 0 [
+          set row (word row "," precision [gradient-diff] of s 1)
+        ] [
+          set row (word row ",")  ; cellule vide → NaN en pandas
+        ]
+    ]
+    file-print row
+  ]
+  ; Reset gradient-diff for next tick (grazing sheep keep 0)
+  ask sheep [set gradient-diff 0]
+
+  update-centroid-marker ; update visual marker
+  check-success ; check completion conditions
+  set spreadness-sum (spreadness-sum + flock-spreadness)
+  set spreadness-count (spreadness-count + 1)
+  tick ; advance time
+end
+
+to update-phase
+  if phase = "collecting" [ ; gathering phase
+    let fcx mean [xcor] of sheep  let fcy mean [ycor] of sheep ; global flock center
+    ; check compactness
+    let flock-centered? (distance-between fcx fcy containment-center-x containment-center-y &lt; containment-radius * 0.15) 
+    let flock-compact? (lost-sheep = 0)  ; are all the sheep compacted 
+    if all? sheep [in-containment-zone?] and flock-centered? and flock-compact? [ ; all sheep in zone &amp; centered &amp; compact
+      set phase "holding"  set holding-start-tick ticks ; switch to holding
+      let i 0 ; dog counter
+      ask dogs [set patrol-angle (360 * i / count dogs) set mode "patrolling" set i (i + 1)] ; assign patrol positions
+    ]
+  ]
+  if phase = "holding" [ ; maintaining containment
+    let escape-ratio (count sheep with [not in-containment-zone?]) / count sheep ; proportion escaped
+    let tolerance ifelse-value (nb-dogs = 1) [0.10] [0.05] ; little bit of leeway
+    if escape-ratio &gt; tolerance [ ; too many escaped
+      ; restart collection :
+      set phase "collecting"  set holding-start-tick -1  ask dogs [set mode "collecting"] 
+    ] 
+    ; held long enough :
+    if with-exit? and holding-start-tick != -1 and (ticks - holding-start-tick) &gt;= holding-duration [ 
+      ; we stop the holding counter when it's over
+      set phase "exiting"  set holding-start-tick -1 ask dogs [set mode "driving"] ; start driving to exit
+    ]
+  ]
+  
+end
+
+to update-centroid-marker
+  ifelse any? sheep and see-centroid [ ; if showing centroid
+    ; show position of global flock center
+    ask centroids [setxy mean [xcor] of sheep mean [ycor] of sheep show-turtle] 
+  ] [ ; or hide if not showing
+    ask centroids [hide-turtle] 
+  ]
+end
+
+
+
+; SHEEP BEHAVIOR 
+
+to move-sheep
+  update-sheep-state ; determine if fleeing or grazing
+  let dir compute-sheep-direction ; calculate movement direction
+  let dir-x first dir  let dir-y last dir ; extract x and y components
+
+  
+  if state = "grazing" [ ; additional grazing behaviors
+    set dir-x (dir-x + sin heading * grazing-persistence) ; tendency to continue straight
+    set dir-y (dir-y + cos heading * grazing-persistence) ; in current direction
+    ; selecting topological neighbors for alignement 
+    let all-others other sheep in-radius vision-range
+    if n-topological &gt; 0 [
+      if any? all-others [
+        let nearby-sheep min-n-of (min list n-topological (count all-others)) all-others [distance myself]
+        if any? nearby-sheep [ ; if has neighbors
+          let avg-sin mean [sin heading] of nearby-sheep ; average x component
+          let avg-cos mean [cos heading] of nearby-sheep ; average y component
+          if avg-sin != 0 or avg-cos != 0 [ ; if neighbors have direction
+            let avg-heading atan avg-sin avg-cos ; compute average heading
+            set dir-x (dir-x + sin avg-heading * W-alignment) ; align with neighbors
+            set dir-y (dir-y + cos avg-heading * W-alignment) ; weighted alignment
+        ]
+        ]
+      ]
+    ]
+  ]
+    
+  if random 100 &lt; 2 [ ; x% chance to add "noise" to the direction 
+    set dir-x (dir-x + random-float 0.4 - 0.2) ; random float between 0.0 and 0.4, then centered: 
+    set dir-y (dir-y + random-float 0.4 - 0.2) ] ; between -0.2 and 0.2
+  
+  
+  if dir-x != 0 or dir-y != 0 [turn-towards atan dir-x dir-y max-turn] ; turn toward target heading
+  ; levy walk when grazing or constant speed when fleeing
+  let spd ifelse-value (state = "grazing") [levy-step speed-grazing 0.2] [speed] 
+  move-sheep-step spd ; execute movement
+  handle-stuck sheep-stuck-threshold sheep-stuck-ticks 1.5 "random" ; check and resolve stuck
+end
+
+
+
+to update-sheep-state
+  let any-dog-near? any? dogs in-radius R-fleeing-dog ; check close dogs
+  let any-dog-vigilance? any? dogs in-radius R-vigilance ; check wider radius
+  ; flee if dog close or neighbors fleeing
+  ifelse any-dog-near? or (any-dog-vigilance? and check-neighbor-fear-contagion) [ 
+    set state "fleeing"  set speed speed-fleeing  set color pink ; switch to fleeing
+  ] [
+    set state "grazing"  set speed speed-grazing  set color white ; switch to grazing
+  ]
+end
+
+
+to-report check-neighbor-fear-contagion
+  if n-topological = 0 [report false]
+  let all-others other sheep in-radius vision-range ; all sheep, no radius constraint
+  if not any? all-others [report false] ; no other sheep exist
+  ; select N closest neighbors, regardless of distance
+  let neighborss min-n-of (min list n-topological (count all-others)) all-others [distance myself]
+  if not any? neighborss [report false] ; safety check (should never happen)
+  ; check if enough fleeing
+  report (count neighborss with [state = "fleeing"] / count neighborss) &gt;= fear-contagion-threshold 
+end
+
+
+to-report compute-sheep-direction
+  let dir-x 0  let dir-y 0 ; initialize force vector
+  
+  ; 1. flee from dogs
+  let dogs-nearby dogs in-radius R-fleeing-dog ; get threatening dogs
+  if any? dogs-nearby [ ; if dogs present
+    ; weaker near gate:
+    let flee-strength ifelse-value (phase = "exiting" and near-gate?) [W-flee-near-gate] [W-flee-strength] 
+    ask dogs-nearby [ ; for each threatening dog
+      let d distance myself ; distance to this dog
+      if d &gt; 0.01 [ ; avoid division by zero
+        let force (flee-strength * (R-fleeing-dog - d) / d) ; inverse distance force
+        let angle ([towards myself] of myself + 180) 
+        set dir-x (dir-x + force * sin angle)  set dir-y (dir-y + force * cos angle) ; add to total force
+      ]
+    ]
+  ]
+ 
+  ; 2. repulsion from other sheep
+  let stress-mult ifelse-value (state = "fleeing") [stress-repulsion-mult] [1] ; reduce repulsion when stressed
+  ask other sheep in-radius R-repulsion [ ; for each too-close sheep
+    let d distance myself ; distance to neighbor
+    if d &gt; 0.01 [ ; avoid division by zero
+      ; repulsion force depending on if the sheep is fleeing or grazing
+      let force ((R-repulsion - d) / d * W-sheep-repulsion * stress-mult) 
+      ; myself - neighbor = direction from neighbor to myself 
+      set dir-x (dir-x + ([xcor] of myself - xcor) * force)  ; moving away 
+      set dir-y (dir-y + ([ycor] of myself - ycor) * force) ; from neighbor
+    ]
+  ]
+  
+  ; 3. cohesion
+  let cohesion-result compute-cohesion ; get cohesion vector
+  ; add to total
+  set dir-x (dir-x + first cohesion-result)  
+  set dir-y (dir-y + last cohesion-result) 
+  
+  ; 4. gate attraction
+  if phase = "exiting" [ ; only during exit phase
+    let gate-dir compute-gate-attraction ; calculate gate pull
+    set dir-x (dir-x + first gate-dir)  ; add to total
+    set dir-y (dir-y + last gate-dir) 
+  ]
+  
+  ; 5. wall avoidance - - compute wall repulsion :
+  let wall-dir (compute-wall-avoidance-generic wall-avoidance-radius wall-avoidance-strength true)
+  set dir-x (dir-x + first wall-dir)  
+  set dir-y (dir-y + last wall-dir) ; add to total
+  
+  report list dir-x dir-y ; return final direction vector
+end
+
+
+
+to-report compute-cohesion
+  let dir-x 0  let dir-y 0 ; initialize cohesion force
+  
+  if n-topological &gt; 0 [
+    let visible-others other sheep in-radius vision-range ; only sheep within vision range
+    let neigh min-n-of (min list n-topological (count visible-others)) visible-others [distance myself] ; get n closest visible neighbors 
+    ; Local Mass Center LCM
+    if any? neigh [ ; if has neighbors
+      let cx mean [xcor] of neigh  let cy mean [ycor] of neigh ; center of neighbors
+      let dist-to-neigh distancexy cx cy ; distance to neighbor center
+      if dist-to-neigh &gt; 0.01 [ ; avoid division by zero
+        let angle towardsxy cx cy ; direction to neighbors
+        if state = "fleeing" and dist-to-neigh &gt; R-repulsion [ ; strong cohesion when fleeing
+          set dir-x (dir-x + W-neigh-fleeing-cohesion * sin angle)  set dir-y (dir-y + W-neigh-fleeing-cohesion * cos angle) ; pull toward neighbors
+        ]
+        if state = "grazing" and dist-to-neigh &gt; (R-repulsion * 2) [ ; weak cohesion when grazing
+          set dir-x (dir-x + W-neigh-grazing-cohesion * sin angle)  set dir-y (dir-y + W-neigh-grazing-cohesion * cos angle) ; gentle pull
+        ]
+      ]
+    ]
+  ]
+
+  ; === Global cohesion (with gradient logging) ===
+  ; Compute BOTH directions (gradient + true GCM) for every fleeing sheep,
+  ; store the angular difference in gradient-diff for CSV export,
+  ; then apply whichever mode is selected for actual movement.
+  if state = "fleeing" and count sheep &gt; 1 [
+    ; 1) Gradient direction: angle toward the densest visible sector (8 sectors)
+    let gradient-dir densest-sector-direction
+    
+    ; 2) True GCM direction: angle toward the actual centroid of all sheep
+    let global-cx mean [xcor] of sheep  let global-cy mean [ycor] of sheep
+    let centroid-dir towardsxy global-cx global-cy
+    
+    ; 3) Store the angular difference for this sheep (will be written to CSV in go)
+    ;    subtract-headings returns the shortest difference in [-180, 180]
+    ;    e.g. gradient=90°, centroid=100° → diff = -10°
+    ;    gradient-diff stays 0 for grazing sheep or if no visible sector
+    if gradient-dir != -1 [
+      set gradient-diff subtract-headings gradient-dir centroid-dir
+    ]
+    
+    ; 4) Apply the selected mode for actual movement (unchanged behavior)
+    ifelse use-density-gradient? [
+      ; DENSITY GRADIENT MODE: sheep moves toward densest visible sector
+      if gradient-dir != -1 [
+        set dir-x (dir-x + W-global-cohesion * sin gradient-dir)
+        set dir-y (dir-y + W-global-cohesion * cos gradient-dir)
+      ]
+    ] [
+      ; CLASSIC CENTROID MODE: sheep moves toward true GCM
+      let dist-to-global distancexy global-cx global-cy
+      if dist-to-global &gt; 0.01 [
+        let angle towardsxy global-cx global-cy
+        set dir-x (dir-x + W-global-cohesion * sin angle)
+        set dir-y (dir-y + W-global-cohesion * cos angle)
+      ]
+    ]
+  ]
+  report list dir-x dir-y ; return cohesion vector
+end
+
+to-report densest-sector-direction
+  let sector-size (360 / nb-sectors)
+  let visible other sheep in-radius vision-range
+  if not any? visible [report -1]
+
+  ; pre-compute angles from me to each visible sheep
+  let angles map [s -&gt; ifelse-value (distance s &gt; 0.01) [towards s] [-1]] sort visible
+  set angles filter [a -&gt; a != -1] angles
+
+  ; count sheep in each sector
+  let best-sector -1
+  let max-count 0
+  let i 0
+  repeat nb-sectors [
+    let sector-start (i * sector-size)
+    let sector-end (sector-start + sector-size)
+    let c length filter [a -&gt; angle-in-sector? a sector-start sector-end] angles
+    if c &gt; max-count [
+      set max-count c
+      set best-sector i
+    ]
+    set i (i + 1)
+  ]
+
+  if best-sector = -1 [report -1]
+  report (best-sector * sector-size + sector-size / 2)
+end
+
+; check if an angle falls within a sector (handles 360° wrap-around)
+to-report angle-in-sector? [a start-a end-a]
+  set a a mod 360
+  set start-a start-a mod 360
+  set end-a end-a mod 360
+  ifelse start-a &lt; end-a
+    [report a &gt;= start-a and a &lt; end-a]
+    [report a &gt;= start-a or a &lt; end-a] ; wrap-around case
+end
+
+
+to-report compute-gate-attraction
+  let dir-x 0  let dir-y 0 ; initialize gate force
+  let intensity ifelse-value (any? dogs in-radius R-fleeing-dog) [1.5] [0.3] ; stronger with dogs nearby
+  if near-gate? [set dir-x (dir-x + 1.5 * intensity)] ; pull right when near gate
+  if (xcor &gt;= gate-x - 5 and ycor &gt;= gate-min-y and ycor &lt;= gate-max-y) [set dir-x (dir-x + 5.0)] ; strong pull at gate
+  if xcor &gt;= gate-x - 10 [ ; funnel zone
+    let funnel-strength (0.6 * intensity) ; base funnel force
+    let proximity-factor (2 - (gate-x - xcor) / 5) ; stronger when closer to gate
+     ; push down if too high:
+    if ycor &gt; gate-max-y [set dir-y (dir-y - funnel-strength * proximity-factor * (1 + (ycor - gate-max-y) * 0.3))]
+    ; push up if too low:
+    if ycor &lt; gate-min-y [set dir-y (dir-y + funnel-strength * proximity-factor * (1 + (gate-min-y - ycor) * 0.3))] 
+  ]
+  report list dir-x dir-y ; return gate attraction vector
+end
+
+to-report near-gate?
+  report xcor &gt;= gate-x - 3 and ycor &gt;= gate-min-y - 5 and ycor &lt;= gate-max-y + 5 ; check if in gate area
+end
+
+to move-sheep-step [dist]
+if phase != "exiting" [fd dist] ; normal movement if not exiting
+if phase = "exiting" [ ; small steps for collision checking
+  repeat ceiling (dist / 0.25) [
+    let ahead patch-ahead 0.25 ; check next patch
+    if ahead != nobody and [is-wall?] of ahead [rt 90 + random 180 stop] ; bounce off walls
+    fd 0.25 ; move forward
+    if xcor &gt;= gate-x and ycor &gt;= gate-min-y and ycor &lt;= gate-max-y [ ; check if through gate
+      set sheep-captured (sheep-captured + 1) die stop ; count and remove
+    ]
+  ]
+]
+end
+
+; DOG BEHAVIOR 
+
+to move-dog
+  if not any? sheep [stop] ; nothing to herd
+  let flock-center-x mean [xcor] of sheep  
+  let flock-center-y mean [ycor] of sheep ; compute flock center
+  let current-speed dog-speed ; default speed
+  
+  ; 1. flock fragmentation retreat - back off if flock is splitting
+  let dispersion-ratio (lost-sheep / count sheep)
+  let dist-to-flock (distancexy flock-center-x flock-center-y)
+  
+  if dispersion-ratio &gt; flock-fragmentation-threshold and (mode = "driving" or mode = "collecting") and dist-to-flock &lt; dog-push-distance * 1.1 [
+    set color red ; warning color
+    ; retreat away from flock
+    let retreat-x (xcor - flock-center-x) ; vector from flock center
+    let retreat-y (ycor - flock-center-y) ; to dog
+    let retreat-mag sqrt (retreat-x ^ 2 + retreat-y ^ 2) ;  magnitude of the vector
+    if retreat-mag &gt; 0.1 [ ; avoid 0 division
+      ; ; face away from flock center
+      facexy (xcor + retreat-x / retreat-mag * dog-retreat-distance) (ycor + retreat-y / retreat-mag * dog-retreat-distance)
+      fd current-speed * 0.5 ; half speed to goo gently
+      set dist-traveled (dist-traveled + current-speed * 0.5)
+    ]
+    stop ; skip normal movement
+  ]
+  
+  ; 2. get dog-dog repulsion
+  let repulsion compute-dog-repulsion 
+  let rep-x first repulsion  
+  let rep-y last repulsion ; extract components
+  
+
+  let desired list 0 0 ; initialize desired direction
+  if mode = "collecting" [ ; collecting takes priority regardless of phase
+    set color orange
+    set desired move-dog-collecting flock-center-x flock-center-y
+  ]
+  if mode = "patrolling" [ ; only during holding phase
+    set color green
+    set desired move-dog-patrolling
+  ]
+  if mode = "driving" [ ; driving toward gate or toward containment
+    set color brown
+    set desired move-dog-driving flock-center-x flock-center-y
+  ]
+  
+  let desired-x first desired  
+  let desired-y last desired ; extract components
+  
+  ; 3. wall avoidance
+  let wall-dir (compute-wall-avoidance-generic 3 1 false) ; compute wall force
+  set desired-x (desired-x + first wall-dir)  
+  set desired-y (desired-y + last wall-dir) ; add to desired
+  
+  ; 4. avoid getting too close to sheep (not during patrolling)
+  if mode != "patrolling" [ ; when actively herding
+    ask sheep in-radius (R-fleeing-dog * 0.5) [ ; sheep too close
+      let d distance myself ; distance to sheep
+      if d &gt; 0.1 [ ; avoid division by zero
+        let push (1 * (R-fleeing-dog * 0.5 - d) / d) ; repulsion force stronger when closer
+        set desired-x (desired-x + ([xcor] of myself - xcor) * push)  
+        set desired-y (desired-y + ([ycor] of myself - ycor) * push) ; push away
+      ]
+    ]
+  ]
+  
+  let final-x (desired-x + rep-x * dog-repulsion-weight) ; combine desired and repulsion
+  let final-y (desired-y + rep-y * dog-repulsion-weight) ; weighted sum
+  
+  ; 5. hard constraint: patrolling dogs stay on perimeter and don't go inside
+  if mode = "patrolling" [ ; when patrolling
+    let my-dist-to-center (distancexy containment-center-x containment-center-y) ; how far from zone center
+    let min-patrol-dist (containment-radius + 1) ; just outside containment
+    if my-dist-to-center &lt; min-patrol-dist [ ; drifted too close to center
+      let away-x (xcor - containment-center-x)  
+      let away-y (ycor - containment-center-y) ; direction pointing outward from center
+      let away-mag sqrt (away-x ^ 2 + away-y ^ 2) ; length of this vector
+      if away-mag &gt; 0.01 [ ; avoid division by zero
+        let push-strength 5.0 * (min-patrol-dist - my-dist-to-center) ; stronger the closer to center
+        ; completely override all other forces to push back out
+        set final-x (away-x / away-mag * push-strength)  
+        set final-y (away-y / away-mag * push-strength)
+      ]
+    ]
+  ]
+  
+  if final-x != 0 or final-y != 0 [facexy (xcor + final-x) (ycor + final-y)] ; turn toward target
+  
+  ; 6. speed adjustments - two independent slowdown mechanisms
+  let move-dist current-speed ; start with base speed (1)
+  
+  ; slowdown 1: avoid colliding with other dogs
+  if any? other dogs [ ; check if other dogs exist
+    let min-dist min [distance myself] of other dogs ; find closest dog
+    if min-dist &lt; 5 [ ; within collision risk zone
+      ; gradual slowdown: at dist=0 -&gt; 50% speed, at dist=4 -&gt; 100% speed
+      set move-dist (move-dist * (0.5 + 0.5 * min-dist / 4))
+    ]
+  ]
+  
+  ; slowdown 2: avoid going into the flock
+  set dist-to-flock distancexy flock-center-x flock-center-y ; recalculate distance to flock center
+  if dist-to-flock &lt; dog-push-distance * dog-proximity-slowdown [ ; within proximity zone (13 × 1.3 = 16.9)
+    ; gradual slowdown: at dist=0 -&gt; 20% speed, at dist -&gt; 100% speed, capped at minimum 20%
+    set move-dist (move-dist * max list 0.2 (dist-to-flock / (dog-push-distance * dog-proximity-slowdown)))
+  ]
+  
+  fd move-dist ; move forward with adjusted speed (both slowdowns can add)
+  set dist-traveled (dist-traveled + move-dist) 
+  handle-stuck dog-stuck-threshold dog-stuck-ticks 3 "toward-flock" ; detect stuck, escape toward flock if needed
+end
+
+
+
+
+to-report move-dog-collecting [fcx fcy]
+  
+  let dir-x 0  let dir-y 0 ; initialize movement vector
+  let outliers sheep with [distancexy fcx fcy &gt; lost-threshold] ; sheep too far from flock center
+  ; trying to find a target
+  ifelse lost-sheep &gt; 0 [ ; flock is dispersed
+    let taken [target-sheep] of other dogs with [target-sheep != nobody] ; sheep already targeted by other dogs
+    let available outliers with [not member? self taken] ; untargeted outliers
+    set target-sheep nobody ; clear current target
+    if any? available [set target-sheep min-one-of available [distance myself]] ; pick closest available outlier
+    
+    ; 1. if target found -&gt; aim behind it relative to flock center
+    if target-sheep != nobody [ ; if we have a target
+      let tx [xcor] of target-sheep  
+      let ty [ycor] of target-sheep ; target position
+      let d (distance-between tx ty fcx fcy) ; target distance from flock center
+      if d &gt; 0.001 [ ; avoid division by zero
+        let behind-x (tx + dog-behind-distance * (tx - fcx) / d) ; position behind target relative to flock
+        let behind-y (ty + dog-behind-distance * (ty - fcy) / d) ; normalized vector
+        let curve (compute-curved-approach behind-x behind-y target-sheep) ; curved path to avoid rushing straight at sheep
+        set dir-x first curve  set dir-y last curve ; extract components
+      ]
+    ] ; if no target free: do not do anything (avoid blowing up the flock) --&gt; STAY IDLE
+  ] 
+  [ ; flock is compact -&gt; position in formation behind flock
+    set target-sheep nobody ; no individual target needed
+    let target-x ifelse-value (phase = "exiting") [gate-x - 5] [containment-center-x]
+    let target-y ifelse-value (phase = "exiting") [0] [containment-center-y]
+    let d (distance-between fcx fcy target-x target-y)
+    if d &gt; 1 [ ; if flock not already at target
+      let angle atan (target-x - fcx) (target-y - fcy)
+      let my-index position self (sort dogs) ; get index based on who
+      let total count dogs ; total dog count for formation
+      let offset (dog-formation-spread * (my-index - (total - 1) / 2) / max list 1 (total - 1)) ; spread in arc
+      let behind-angle (angle + 180 + offset) ; position behind flock with offset
+      set dir-x (fcx + dog-push-distance * sin behind-angle - xcor) ; compute formation position
+      set dir-y (fcy + dog-push-distance * cos behind-angle - ycor) ; relative to flock
+    ]
+  ]
+  report list dir-x dir-y ; return movement vector
+end
+
+to-report move-dog-patrolling
+  let dir-x 0  let dir-y 0 ; initialize movement vector
+  
+  let patrolling-dogs sort dogs with [mode = "patrolling"] ; get all patrolling dogs
+  let my-index position self patrolling-dogs ; find my position in list
+  if my-index = false [set my-index 0] ; fallback if not found
+  let total-patrolling max list 1 (length patrolling-dogs) ; number of patrolling dogs
+  let my-current-angle atan (xcor - containment-center-x) (ycor - containment-center-y) ; my angle from center
+  let target-angle 0 ; where to patrol
+  
+  ifelse total-patrolling = 1 [ ; single dog patrols whole perimeter
+    let most-threatening-sheep max-one-of sheep [distancexy containment-center-x containment-center-y] ; sheep closest to edge
+    ifelse most-threatening-sheep != nobody [ ; if found
+      let sx [xcor] of most-threatening-sheep  let sy [ycor] of most-threatening-sheep ; sheep position
+      set target-angle atan (sx - containment-center-x) (sy - containment-center-y) ; patrol toward threat
+    ] [set target-angle my-current-angle] ; stay in place if no threats
+  ] [
+    let section-size (360 / total-patrolling) ; divide perimeter into sectors
+    let my-start-angle (my-index * section-size) ; start of my sector
+    let my-end-angle (my-start-angle + section-size) ; end of my sector
+    let my-center-angle (my-start-angle + section-size / 2) ; center of my sector
+    
+    let sheep-list [] ; sheep in my sector
+    foreach sort sheep [s -&gt; ; for each sheep
+      let sx [xcor] of s  let sy [ycor] of s ; sheep position
+      let sheep-angle-from-center atan (sx - containment-center-x) (sy - containment-center-y) ; angle from center
+      if angle-in-range sheep-angle-from-center my-start-angle my-end-angle [ ; if in my sector
+        set sheep-list lput s sheep-list ; add to list
+      ]
+    ]
+    let sheep-in-my-sector turtle-set sheep-list ; convert to agentset
+    
+    ifelse any? sheep-in-my-sector [ ; if sheep in my sector
+      let most-threatening max-one-of sheep-in-my-sector [distancexy containment-center-x containment-center-y] ; closest to edge
+      let sx [xcor] of most-threatening  let sy [ycor] of most-threatening ; threat position
+      ; constrain to sector :
+      set target-angle clamp-angle (atan (sx - containment-center-x) (sy - containment-center-y)) my-start-angle my-end-angle 
+    ] [set target-angle my-center-angle] ; default to sector center
+  ]
+  
+  let angle-diff subtract-headings target-angle my-current-angle ; angular distance to target
+  ifelse abs angle-diff &gt; 5 [ ; if not at target angle
+    let step-angle 8 ; movement step size
+    let next-angle my-current-angle + (ifelse-value (angle-diff &gt; 0) [step-angle] [0 - step-angle]) ; step toward target
+    set dir-x (containment-center-x + dog-patrol-radius * sin next-angle - xcor) ; position on patrol circle
+    set dir-y (containment-center-y + dog-patrol-radius * cos next-angle - ycor) ; at next angle
+  ] [
+    set dir-x (containment-center-x + dog-patrol-radius * sin target-angle - xcor) ; position on patrol circle
+    set dir-y (containment-center-y + dog-patrol-radius * cos target-angle - ycor) ; at target angle
+  ]
+  
+  let my-dist-to-center distancexy containment-center-x containment-center-y ; distance from center
+  if my-dist-to-center &lt; dog-patrol-radius - 1 [ ; if too close to center
+    let outward-x (xcor - containment-center-x)  let outward-y (ycor - containment-center-y) ; vector away from center
+    let outward-mag sqrt (outward-x ^ 2 + outward-y ^ 2) ; magnitude
+    if outward-mag &gt; 0.01 [ ; avoid division by zero
+      set dir-x (dir-x + outward-x / outward-mag * 2)  set dir-y (dir-y + outward-y / outward-mag * 2) ; push outward
+    ]
+  ]
+  report list dir-x dir-y ; return movement vector
+end
+
+
+
+to-report move-dog-driving [fcx fcy]
+  let dir-x 0  let dir-y 0 ; initialize movement vector
+
+  let drive-x gate-x - 5  let drive-y 0 ; target position near gate
+  let d distance-between fcx fcy drive-x drive-y ; distance to target
+  if d &gt; 1 [ ; if not at target
+    let angle atan (drive-x - fcx) (drive-y - fcy) ; direction to push flock
+    let my-index position self (sort dogs)  let total count dogs ; formation position
+    let offset (dog-formation-spread * (my-index - (total - 1) / 2) / max list 1 (total - 1)) ; spread in arc
+    let behind-angle (angle + 180 + offset) ; position behind flock
+    set dir-x (fcx + dog-push-distance * sin behind-angle - xcor) ; compute target position
+    set dir-y (fcy + dog-push-distance * cos behind-angle - ycor) ; in formation
+  ]
+  report list dir-x dir-y ; return movement vector
+end
+
+
+
+to-report compute-dog-repulsion
+  let rep-x 0  let rep-y 0 ; initialize repulsion vector
+  ask other dogs in-radius R-repulsion-dogs [ ; for each nearby dog
+    let d distance myself ; distance to other dog
+    if d &gt;= 0.1 [ ; avoid division by zero
+      let force ((R-repulsion-dogs - d) / d) ; inverse distance force
+      set rep-x (rep-x + ([xcor] of myself - xcor) * force) ; push away on x
+      set rep-y (rep-y + ([ycor] of myself - ycor) * force) ; push away on y
+    ]
+  ]
+  report list rep-x rep-y ; return repulsion vector
+end
+
+
+to-report compute-curved-approach [dest-x dest-y avoid-object]
+  let goal-dx (dest-x - xcor)  let goal-dy (dest-y - ycor) ; direct path to goal
+  let avoid-dx 0  let avoid-dy 0 ; avoidance componentfal
+  if avoid-object != nobody [ ; if avoiding something
+    let d distance avoid-object ; distance to object
+    if d &lt; dog-approach-curve-radius and d &gt; 0.1 [ ; within curve radius
+      set avoid-dx (xcor - [xcor] of avoid-object)  set avoid-dy (ycor - [ycor] of avoid-object) ; vector away from object
+      let avoid-mag sqrt (avoid-dx ^ 2 + avoid-dy ^ 2) ; magnitude
+      if avoid-mag &gt; 0.01 [ ; avoid division by zero
+        ; strength based on distance
+        let curve-strength (dog-approach-curve-strength * (dog-approach-curve-radius - d) / dog-approach-curve-radius) 
+         ; normalize and scale
+        set avoid-dx (avoid-dx / avoid-mag * curve-strength)  set avoid-dy (avoid-dy / avoid-mag * curve-strength)
+      ]
+    ]
+  ]
+  report list (goal-dx + avoid-dx) (goal-dy + avoid-dy) ; combine goal and avoidance
+end
+
+
+; UTILITIES 
+
+to-report compute-wall-avoidance-generic [radius strength exit-aware?]
+  let dir-x 0  let dir-y 0 ; initialize avoidance vector
+  let d-left (xcor - min-pxcor)  let d-right (max-pxcor - xcor) ; distance to left and right walls
+  let d-bottom (ycor - min-pycor)  let d-top (max-pycor - ycor) ; distance to bottom and top walls
+  
+  if d-left &lt; radius [set dir-x (dir-x + strength / (d-left ^ 2 + 0.01))] ; push away from left wall
+  if d-bottom &lt; radius [set dir-y (dir-y + strength / (d-bottom ^ 2 + 0.01))] ; push away from bottom wall
+  if d-top &lt; radius [set dir-y (dir-y - strength / (d-top ^ 2 + 0.01))] ; push away from top wall
+  
+  if d-right &lt; radius [ ; near right wall
+    let dominated-by-gate? (exit-aware? and phase = "exiting" and ycor &gt;= gate-min-y - 3 and ycor &lt;= gate-max-y + 3) ; check if near gate
+    if not dominated-by-gate? [ ; not near gate opening
+      set dir-x (dir-x - strength / (d-right ^ 2 + 0.01)) ; push away from wall
+      if exit-aware? and phase = "exiting" [ ; if exiting phase
+        let gate-center-y ((gate-min-y + gate-max-y) / 2) ; vertical center of gate
+        set dir-y (dir-y + 0.8 * (gate-center-y - ycor) / (abs(gate-center-y - ycor) + 1)) ; guide toward gate center
+      ]
+    ]
+  ]
+  report list dir-x dir-y ; return avoidance vector
+end
+
+to handle-stuck [threshold max-stuck-ticks escape-dist escape-behavior]
+  let dist-moved distancexy prev-x prev-y ; distance moved since last tick
+  ifelse dist-moved &lt; threshold [ ; if barely moved
+    set stuck-counter (stuck-counter + 1) ; increment stuck counter
+    if stuck-counter &gt; max-stuck-ticks [ ; stuck too long
+      if escape-behavior = "random" [rt random 360] ; random direction for sheep
+      if escape-behavior = "toward-flock" and any? sheep [ ; toward flock for dogs
+        facexy mean [xcor] of sheep mean [ycor] of sheep ; face flock center
+        rt (random 40 - 20) ; add random jitter
+      ]
+      fd escape-dist  set stuck-counter 0 ; jump forward and reset counter
+    ]
+  ] [set stuck-counter 0] ; reset if moved enough
+  set prev-x xcor  set prev-y ycor ; store current position for next check
+end
+
+to-report angle-in-range [angle start-ang end-ang]
+  ; to know if a sheep is within a dog sector when patrolling 
+  report (angle &gt;= start-ang and angle &lt;= end-ang) ; check if angle within range
+end
+
+to-report clamp-angle [angle start-ang end-ang]
+  ; to mmaintin a dog within its sector when patrolling 
+  if angle &lt; start-ang [report start-ang] ; clamp to minimum
+  if angle &gt; end-ang [report end-ang] ; clamp to maximum
+  report angle ; return as is if within range
+end
+
+to turn-towards [target-h max-t]
+  ; the sheep turn slowly towards their direction 
+  let diff subtract-headings target-h heading ; angular difference
+  ; turn by max amount or reach target
+  ifelse abs diff &lt; max-t [set heading target-h] [ifelse diff &gt; 0 [rt max-t] [lt max-t]] 
+end
+
+to-report distance-between [x1 y1 x2 y2]
+  report sqrt ((x2 - x1) ^ 2 + (y2 - y1) ^ 2) ; euclidean distance
+end
+
+to-report is-wall?
+  ; check if patch is wall (not gate opening)
+  report pxcor = gate-x and (pycor &lt; gate-min-y or pycor &gt; gate-max-y) 
+end
+
+
+; SUCCESS &amp; MONITORS 
+
+to check-success
+  ; when to conclude the scenarios
+  
+  if phase = "holding" and not with-exit? [ ; holding mode without exit
+    if holding-start-tick != -1 and (ticks - holding-start-tick) &gt;= holding-duration [ ; held long enough
+      set ticks-to-success ticks  set done? true ; mark success
+    ]
+  ]
+  if phase = "exiting" and not any? sheep [ ; all sheep exited
+  set ticks-to-success ticks ; --&gt; we finished!
+  set done? true
+  ]
+  if phase = "exiting" [ ; only reassign mode when there is a mismatch
+    ifelse lost-sheep &gt; 0 [
+      ; switch only drivers to collecting
+      ask dogs with [mode = "driving"] [set mode "collecting" set target-sheep nobody] 
+    ] [ ; switch only collectors to driving:
+      ask dogs with [mode = "collecting"] [set mode "driving" set target-sheep nobody] 
+    ]
+  ]
+end
+
+to-report sheep-in-zone report count sheep with [in-containment-zone?] end ; count sheep in target zone
+to-report holding-time report ifelse-value (holding-start-tick = -1) [0] [ticks - holding-start-tick] end 
+to-report dogs-distance report sum [dist-traveled] of dogs end ; total distance traveled by all dogs
+to-report lost-sheep  ; how many sheep are considered lost from the flock 
+  if not any? sheep [report 0] ; no sheep means none lost
+  let fcx mean [xcor] of sheep  let fcy mean [ycor] of sheep ; flock center
+  report count sheep with [distancexy fcx fcy &gt; lost-threshold] ; count sheep too far from center
+end
+to-report current-phase report phase end ; return current simulation phase
+to-report sheep-captured-count report sheep-captured end ; return number of exited sheep
+
+
+; METRICS
+to-report flock-spreadness; variance of distances from flock center (lower = more compact)
+  if count sheep &lt; 2 [report 0]
+  let fcx mean [xcor] of sheep  let fcy mean [ycor] of sheep
+  report variance [distancexy fcx fcy] of sheep
+end</code>
+  <widgets>
+    <view x="410" wrappingAllowedX="false" y="20" frameRate="100.0" minPycor="-35" height="929" showTickCounter="true" patchSize="13.0" fontSize="10" wrappingAllowedY="false" width="1320" tickCounterLabel="ticks" maxPycor="35" updateMode="0" maxPxcor="50" minPxcor="-50" />
+    <switch x="210" y="240" height="40" on="true" variable="see-centroid" width="155" display="see-centroid" />
+    <button x="80" y="5" height="40" disableUntilTicks="false" forever="false" kind="Observer" width="65" display="setup">setup</button>
+    <button x="165" y="5" height="40" disableUntilTicks="false" forever="true" kind="Observer" width="60" display="go">go</button>
+    <chooser x="75" y="100" height="60" variable="nb-sheep" current="3" width="250" display="nb-sheep">
+      <choice type="double" value="30.0" />
+      <choice type="double" value="50.0" />
+      <choice type="double" value="100.0" />
+      <choice type="double" value="150.0" />
+      <choice type="double" value="200.0" />
+      <choice type="double" value="250.0" />
+      <choice type="double" value="300.0" />
+      <choice type="double" value="350.0" />
+      <choice type="double" value="400.0" />
+      <choice type="double" value="500.0" />
+      <choice type="double" value="700.0" />
+      <choice type="double" value="1000.0" />
+    </chooser>
+    <switch x="75" y="55" height="40" on="true" variable="use-density-gradient?" width="150" display="use-density-gradient?" />
+    <slider x="70" step="1" y="175" max="6" width="250" display="nb-dogs" height="50" min="0" direction="Horizontal" default="2.0" variable="nb-dogs" />
+    <switch x="60" y="240" height="40" on="true" variable="with-exit?" width="95" display="with-exit?" />
+    <monitor x="15" precision="0" y="295" height="60" fontSize="11" width="100" display="current-phase">current-phase</monitor>
+    <monitor x="10" precision="0" y="375" height="60" fontSize="15" width="100" display="holding-time">holding-time</monitor>
+    <monitor x="10" precision="0" y="455" height="60" fontSize="15" width="100" display="lost-sheep">lost-sheep</monitor>
+    <monitor x="145" precision="1" y="295" height="60" fontSize="11" width="100" display="sheep-in-zone">sheep-in-zone</monitor>
+    <monitor x="130" precision="1" y="375" height="60" fontSize="12" width="100" display="sheep-captured-count">sheep-captured-count</monitor>
+    <monitor x="130" precision="0" y="455" height="60" fontSize="15" width="100" display="dogs-distance">dogs-distance</monitor>
+    <slider x="20" step="1" y="520" max="30" width="250" display="n-topological" height="50" min="0" direction="Horizontal" default="7.0" variable="n-topological" />
+    <slider x="25" step="5" y="575" max="50" width="250" display="vision-range" height="50" min="5" direction="Horizontal" default="30.0" variable="vision-range" />
+    <slider x="25" step="0.25" y="635" max="5" width="250" display="W-global-cohesion" height="50" min="0" direction="Horizontal" default="0.75" variable="W-global-cohesion" />
+    <slider x="30" step="0.5" y="690" max="5" width="250" display="R-repulsion" height="50" min="0" direction="Horizontal" default="3.0" variable="R-repulsion" />
+    <slider x="30" step="0.1" y="750" max="5" width="250" display="W-neigh-grazing-cohesion" height="50" min="0" direction="Horizontal" default="0.5" variable="W-neigh-grazing-cohesion" />
+    <slider x="20" step="0.1" y="810" max="10" width="250" display="W-neigh-fleeing-cohesion" height="50" min="0" direction="Horizontal" default="1.5" variable="W-neigh-fleeing-cohesion" />
+    <monitor x="25" precision="1" y="870" height="60" fontSize="11" width="115" display="curr. spreadness">flock-spreadness</monitor>
+    <monitor x="180" precision="1" y="870" height="60" fontSize="11" width="100" display="mean spreadness">mean-spreadness</monitor>
+  </widgets>
+  <info># Sheep Herding Simulation — Gradient-Logging Variant
+
+This is the instrumented variant of `sheepherding.nlogox`, used to validate the density-gradient heuristic. The sheep and dog behaviour rules are the same. The difference: at every tick, each fleeing sheep computes both candidate global-cohesion directions, the locally densest sector and the true global centre of mass. The model logs the signed angular difference between the two to a CSV file named `gradient_D&lt;nb-dogs&gt;_N&lt;nb-sheep&gt;.csv`, one file per (D, N) condition, so run it with a single repetition per condition. Only the direction selected by `use-density-gradient?` is applied to movement, so the instrumentation does not perturb the dynamics.
+
+## Running the model
+
+Open this file with NetLogo (7.0.3 or later). Choose the parameters, click **Setup**, then **Go**. A run stops at success or at 10,000 ticks, closing its log file.
+
+## Controls and parameters
+
+Unlike the main model, the flocking parameters are live widgets here:
+
+- **`nb-sheep`** — Chooser for the flock size (30 to 1000).
+- **`nb-dogs`** — Slider for the number of dogs (0 to 6; the logging campaign drove it up to 35 through BehaviorSpace).
+- **`use-density-gradient?`** — ON: fleeing sheep use the local density gradient. OFF: they use the true global centre of mass.
+- **`with-exit?`** — ON: after 800 held ticks the dogs drive the flock out through the gate. OFF: holding the flock for 800 ticks is itself a success.
+- **`see-centroid`** — Shows a marker at the flock's global centre of mass.
+- **`R-repulsion`**, **`n-topological`**, **`vision-range`**, **`W-global-cohesion`**, **`W-neigh-fleeing-cohesion`**, **`W-neigh-grazing-cohesion`** — Sliders for the flocking parameters (baseline: 3.0, 7, 30, 0.75, 1.5, 0.5).
+
+## Output
+
+One wide CSV per (D, N) condition: a `tick` column plus one column per sheep, holding the signed angular error (degrees) of the density-gradient direction relative to the true centre-of-mass direction, for sheep that are fleeing that tick. Logging is suspended during the exiting phase. The aggregated statistics of the full 110-condition campaign are in `data/gradient_summary.csv`, analysed by `analysis/gradient_validation.ipynb`.
+</info>
+  <turtleShapes>
+    <shape name="default" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="5" />
+        <point x="40" y="250" />
+        <point x="150" y="205" />
+        <point x="260" y="250" />
+      </polygon>
+    </shape>
+    <shape name="airplane" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0" />
+        <point x="135" y="15" />
+        <point x="120" y="60" />
+        <point x="120" y="105" />
+        <point x="15" y="165" />
+        <point x="15" y="195" />
+        <point x="120" y="180" />
+        <point x="135" y="240" />
+        <point x="105" y="270" />
+        <point x="120" y="285" />
+        <point x="150" y="270" />
+        <point x="180" y="285" />
+        <point x="210" y="270" />
+        <point x="165" y="240" />
+        <point x="180" y="180" />
+        <point x="285" y="195" />
+        <point x="285" y="165" />
+        <point x="180" y="105" />
+        <point x="180" y="60" />
+        <point x="165" y="15" />
+      </polygon>
+    </shape>
+    <shape name="arrow" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0" />
+        <point x="0" y="150" />
+        <point x="105" y="150" />
+        <point x="105" y="293" />
+        <point x="195" y="293" />
+        <point x="195" y="150" />
+        <point x="300" y="150" />
+      </polygon>
+    </shape>
+    <shape name="box" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="285" />
+        <point x="285" y="225" />
+        <point x="285" y="75" />
+        <point x="150" y="135" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="135" />
+        <point x="15" y="75" />
+        <point x="150" y="15" />
+        <point x="285" y="75" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="75" />
+        <point x="15" y="225" />
+        <point x="150" y="285" />
+        <point x="150" y="135" />
+      </polygon>
+      <line endX="150" startY="285" marked="false" color="255" endY="135" startX="150" />
+      <line endX="15" startY="135" marked="false" color="255" endY="75" startX="150" />
+      <line endX="285" startY="135" marked="false" color="255" endY="75" startX="150" />
+    </shape>
+    <shape name="bug" rotatable="true" editableColorIndex="0">
+      <circle x="96" y="182" marked="true" color="-1920102913" diameter="108" filled="true" />
+      <circle x="110" y="127" marked="true" color="-1920102913" diameter="80" filled="true" />
+      <circle x="110" y="75" marked="true" color="-1920102913" diameter="80" filled="true" />
+      <line endX="80" startY="100" marked="true" color="-1920102913" endY="30" startX="150" />
+      <line endX="220" startY="100" marked="true" color="-1920102913" endY="30" startX="150" />
+    </shape>
+    <shape name="butterfly" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165" />
+        <point x="209" y="199" />
+        <point x="225" y="225" />
+        <point x="225" y="255" />
+        <point x="195" y="270" />
+        <point x="165" y="255" />
+        <point x="150" y="240" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165" />
+        <point x="89" y="198" />
+        <point x="75" y="225" />
+        <point x="75" y="255" />
+        <point x="105" y="270" />
+        <point x="135" y="255" />
+        <point x="150" y="240" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="139" y="148" />
+        <point x="100" y="105" />
+        <point x="55" y="90" />
+        <point x="25" y="90" />
+        <point x="10" y="105" />
+        <point x="10" y="135" />
+        <point x="25" y="180" />
+        <point x="40" y="195" />
+        <point x="85" y="194" />
+        <point x="139" y="163" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="162" y="150" />
+        <point x="200" y="105" />
+        <point x="245" y="90" />
+        <point x="275" y="90" />
+        <point x="290" y="105" />
+        <point x="290" y="135" />
+        <point x="275" y="180" />
+        <point x="260" y="195" />
+        <point x="215" y="195" />
+        <point x="162" y="165" />
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255" />
+        <point x="135" y="225" />
+        <point x="120" y="150" />
+        <point x="135" y="120" />
+        <point x="150" y="105" />
+        <point x="165" y="120" />
+        <point x="180" y="150" />
+        <point x="165" y="225" />
+      </polygon>
+      <circle x="135" y="90" marked="false" color="255" diameter="30" filled="true" />
+      <line endX="195" startY="105" marked="false" color="255" endY="60" startX="150" />
+      <line endX="105" startY="105" marked="false" color="255" endY="60" startX="150" />
+    </shape>
+    <shape name="car" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="300" y="180" />
+        <point x="279" y="164" />
+        <point x="261" y="144" />
+        <point x="240" y="135" />
+        <point x="226" y="132" />
+        <point x="213" y="106" />
+        <point x="203" y="84" />
+        <point x="185" y="63" />
+        <point x="159" y="50" />
+        <point x="135" y="50" />
+        <point x="75" y="60" />
+        <point x="0" y="150" />
+        <point x="0" y="165" />
+        <point x="0" y="225" />
+        <point x="300" y="225" />
+        <point x="300" y="180" />
+      </polygon>
+      <circle x="180" y="180" marked="false" color="255" diameter="90" filled="true" />
+      <circle x="30" y="180" marked="false" color="255" diameter="90" filled="true" />
+      <polygon color="255" filled="true" marked="false">
+        <point x="162" y="80" />
+        <point x="132" y="78" />
+        <point x="134" y="135" />
+        <point x="209" y="135" />
+        <point x="194" y="105" />
+        <point x="189" y="96" />
+        <point x="180" y="89" />
+      </polygon>
+      <circle x="47" y="195" marked="true" color="-1920102913" diameter="58" filled="true" />
+      <circle x="195" y="195" marked="true" color="-1920102913" diameter="58" filled="true" />
+    </shape>
+    <shape name="circle" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true" />
+    </shape>
+    <shape name="circle 2" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true" />
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true" />
+    </shape>
+    <shape name="cow" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="200" y="193" />
+        <point x="197" y="249" />
+        <point x="179" y="249" />
+        <point x="177" y="196" />
+        <point x="166" y="187" />
+        <point x="140" y="189" />
+        <point x="93" y="191" />
+        <point x="78" y="179" />
+        <point x="72" y="211" />
+        <point x="49" y="209" />
+        <point x="48" y="181" />
+        <point x="37" y="149" />
+        <point x="25" y="120" />
+        <point x="25" y="89" />
+        <point x="45" y="72" />
+        <point x="103" y="84" />
+        <point x="179" y="75" />
+        <point x="198" y="76" />
+        <point x="252" y="64" />
+        <point x="272" y="81" />
+        <point x="293" y="103" />
+        <point x="285" y="121" />
+        <point x="255" y="121" />
+        <point x="242" y="118" />
+        <point x="224" y="167" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="73" y="210" />
+        <point x="86" y="251" />
+        <point x="62" y="249" />
+        <point x="48" y="208" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="25" y="114" />
+        <point x="16" y="195" />
+        <point x="9" y="204" />
+        <point x="23" y="213" />
+        <point x="25" y="200" />
+        <point x="39" y="123" />
+      </polygon>
+    </shape>
+    <shape name="cylinder" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true" />
+    </shape>
+    <shape name="dot" rotatable="false" editableColorIndex="0">
+      <circle x="90" y="90" marked="true" color="-1920102913" diameter="120" filled="true" />
+    </shape>
+    <shape name="face happy" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true" />
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true" />
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true" />
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255" />
+        <point x="90" y="239" />
+        <point x="62" y="213" />
+        <point x="47" y="191" />
+        <point x="67" y="179" />
+        <point x="90" y="203" />
+        <point x="109" y="218" />
+        <point x="150" y="225" />
+        <point x="192" y="218" />
+        <point x="210" y="203" />
+        <point x="227" y="181" />
+        <point x="251" y="194" />
+        <point x="236" y="217" />
+        <point x="212" y="240" />
+      </polygon>
+    </shape>
+    <shape name="face neutral" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="7" marked="true" color="-1920102913" diameter="285" filled="true" />
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true" />
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true" />
+      <rectangle endX="240" startY="195" marked="false" color="255" endY="225" startX="60" filled="true" />
+    </shape>
+    <shape name="face sad" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true" />
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true" />
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true" />
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="168" />
+        <point x="90" y="184" />
+        <point x="62" y="210" />
+        <point x="47" y="232" />
+        <point x="67" y="244" />
+        <point x="90" y="220" />
+        <point x="109" y="205" />
+        <point x="150" y="198" />
+        <point x="192" y="205" />
+        <point x="210" y="220" />
+        <point x="227" y="242" />
+        <point x="251" y="229" />
+        <point x="236" y="206" />
+        <point x="212" y="183" />
+      </polygon>
+    </shape>
+    <shape name="fish" rotatable="false" editableColorIndex="0">
+      <polygon color="-1" filled="true" marked="false">
+        <point x="44" y="131" />
+        <point x="21" y="87" />
+        <point x="15" y="86" />
+        <point x="0" y="120" />
+        <point x="15" y="150" />
+        <point x="0" y="180" />
+        <point x="13" y="214" />
+        <point x="20" y="212" />
+        <point x="45" y="166" />
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="135" y="195" />
+        <point x="119" y="235" />
+        <point x="95" y="218" />
+        <point x="76" y="210" />
+        <point x="46" y="204" />
+        <point x="60" y="165" />
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="75" y="45" />
+        <point x="83" y="77" />
+        <point x="71" y="103" />
+        <point x="86" y="114" />
+        <point x="166" y="78" />
+        <point x="135" y="60" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="136" />
+        <point x="151" y="77" />
+        <point x="226" y="81" />
+        <point x="280" y="119" />
+        <point x="292" y="146" />
+        <point x="292" y="160" />
+        <point x="287" y="170" />
+        <point x="270" y="195" />
+        <point x="195" y="210" />
+        <point x="151" y="212" />
+        <point x="30" y="166" />
+      </polygon>
+      <circle x="215" y="106" marked="false" color="255" diameter="30" filled="true" />
+    </shape>
+    <shape name="flag" rotatable="false" editableColorIndex="0">
+      <rectangle endX="75" startY="15" marked="true" color="-1920102913" endY="300" startX="60" filled="true" />
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="90" y="150" />
+        <point x="270" y="90" />
+        <point x="90" y="30" />
+      </polygon>
+      <line endX="90" startY="135" marked="true" color="-1920102913" endY="135" startX="75" />
+      <line endX="90" startY="45" marked="true" color="-1920102913" endY="45" startX="75" />
+    </shape>
+    <shape name="flower" rotatable="false" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="135" y="120" />
+        <point x="165" y="165" />
+        <point x="180" y="210" />
+        <point x="180" y="240" />
+        <point x="150" y="300" />
+        <point x="165" y="300" />
+        <point x="195" y="240" />
+        <point x="195" y="195" />
+        <point x="165" y="135" />
+      </polygon>
+      <circle x="85" y="132" marked="true" color="-1920102913" diameter="38" filled="true" />
+      <circle x="130" y="147" marked="true" color="-1920102913" diameter="38" filled="true" />
+      <circle x="192" y="85" marked="true" color="-1920102913" diameter="38" filled="true" />
+      <circle x="85" y="40" marked="true" color="-1920102913" diameter="38" filled="true" />
+      <circle x="177" y="40" marked="true" color="-1920102913" diameter="38" filled="true" />
+      <circle x="177" y="132" marked="true" color="-1920102913" diameter="38" filled="true" />
+      <circle x="70" y="85" marked="true" color="-1920102913" diameter="38" filled="true" />
+      <circle x="130" y="25" marked="true" color="-1920102913" diameter="38" filled="true" />
+      <circle x="96" y="51" marked="true" color="-1920102913" diameter="108" filled="true" />
+      <circle x="113" y="68" marked="false" color="255" diameter="74" filled="true" />
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="189" y="233" />
+        <point x="219" y="188" />
+        <point x="249" y="173" />
+        <point x="279" y="188" />
+        <point x="234" y="218" />
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="180" y="255" />
+        <point x="150" y="210" />
+        <point x="105" y="210" />
+        <point x="75" y="240" />
+        <point x="135" y="240" />
+      </polygon>
+    </shape>
+    <shape name="house" rotatable="false" editableColorIndex="0">
+      <rectangle endX="255" startY="120" marked="true" color="-1920102913" endY="285" startX="45" filled="true" />
+      <rectangle endX="180" startY="210" marked="false" color="255" endY="285" startX="120" filled="true" />
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="120" />
+        <point x="150" y="15" />
+        <point x="285" y="120" />
+      </polygon>
+      <line endX="270" startY="120" marked="false" color="255" endY="120" startX="30" />
+    </shape>
+    <shape name="leaf" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="210" />
+        <point x="135" y="195" />
+        <point x="120" y="210" />
+        <point x="60" y="210" />
+        <point x="30" y="195" />
+        <point x="60" y="180" />
+        <point x="60" y="165" />
+        <point x="15" y="135" />
+        <point x="30" y="120" />
+        <point x="15" y="105" />
+        <point x="40" y="104" />
+        <point x="45" y="90" />
+        <point x="60" y="90" />
+        <point x="90" y="105" />
+        <point x="105" y="120" />
+        <point x="120" y="120" />
+        <point x="105" y="60" />
+        <point x="120" y="60" />
+        <point x="135" y="30" />
+        <point x="150" y="15" />
+        <point x="165" y="30" />
+        <point x="180" y="60" />
+        <point x="195" y="60" />
+        <point x="180" y="120" />
+        <point x="195" y="120" />
+        <point x="210" y="105" />
+        <point x="240" y="90" />
+        <point x="255" y="90" />
+        <point x="263" y="104" />
+        <point x="285" y="105" />
+        <point x="270" y="120" />
+        <point x="285" y="135" />
+        <point x="240" y="165" />
+        <point x="240" y="180" />
+        <point x="270" y="195" />
+        <point x="240" y="210" />
+        <point x="180" y="210" />
+        <point x="165" y="195" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="195" />
+        <point x="135" y="240" />
+        <point x="120" y="255" />
+        <point x="105" y="255" />
+        <point x="105" y="285" />
+        <point x="135" y="285" />
+        <point x="165" y="240" />
+        <point x="165" y="195" />
+      </polygon>
+    </shape>
+    <shape name="line" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="300" startX="150" />
+    </shape>
+    <shape name="line half" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="150" startX="150" />
+    </shape>
+    <shape name="pentagon" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="15" />
+        <point x="15" y="120" />
+        <point x="60" y="285" />
+        <point x="240" y="285" />
+        <point x="285" y="120" />
+      </polygon>
+    </shape>
+    <shape name="person" rotatable="false" editableColorIndex="0">
+      <circle x="110" y="5" marked="true" color="-1920102913" diameter="80" filled="true" />
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90" />
+        <point x="120" y="195" />
+        <point x="90" y="285" />
+        <point x="105" y="300" />
+        <point x="135" y="300" />
+        <point x="150" y="225" />
+        <point x="165" y="300" />
+        <point x="195" y="300" />
+        <point x="210" y="285" />
+        <point x="180" y="195" />
+        <point x="195" y="90" />
+      </polygon>
+      <rectangle endX="172" startY="79" marked="true" color="-1920102913" endY="94" startX="127" filled="true" />
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="195" y="90" />
+        <point x="240" y="150" />
+        <point x="225" y="180" />
+        <point x="165" y="105" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90" />
+        <point x="60" y="150" />
+        <point x="75" y="180" />
+        <point x="135" y="105" />
+      </polygon>
+    </shape>
+    <shape name="plant" rotatable="false" editableColorIndex="0">
+      <rectangle endX="165" startY="90" marked="true" color="-1920102913" endY="300" startX="135" filled="true" />
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="255" />
+        <point x="90" y="210" />
+        <point x="45" y="195" />
+        <point x="75" y="255" />
+        <point x="135" y="285" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="255" />
+        <point x="210" y="210" />
+        <point x="255" y="195" />
+        <point x="225" y="255" />
+        <point x="165" y="285" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="180" />
+        <point x="90" y="135" />
+        <point x="45" y="120" />
+        <point x="75" y="180" />
+        <point x="135" y="210" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="180" />
+        <point x="165" y="210" />
+        <point x="225" y="180" />
+        <point x="255" y="120" />
+        <point x="210" y="135" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="105" />
+        <point x="90" y="60" />
+        <point x="45" y="45" />
+        <point x="75" y="105" />
+        <point x="135" y="135" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="105" />
+        <point x="165" y="135" />
+        <point x="225" y="105" />
+        <point x="255" y="45" />
+        <point x="210" y="60" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="90" />
+        <point x="120" y="45" />
+        <point x="150" y="15" />
+        <point x="180" y="45" />
+        <point x="165" y="90" />
+      </polygon>
+    </shape>
+    <shape name="sheep" rotatable="false" editableColorIndex="15">
+      <circle x="203" y="65" marked="true" color="-1" diameter="88" filled="true" />
+      <circle x="70" y="65" marked="true" color="-1" diameter="162" filled="true" />
+      <circle x="150" y="105" marked="true" color="-1" diameter="120" filled="true" />
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="218" y="120" />
+        <point x="240" y="165" />
+        <point x="255" y="165" />
+        <point x="278" y="120" />
+      </polygon>
+      <circle x="214" y="72" marked="false" color="-1920102913" diameter="67" filled="true" />
+      <rectangle endX="179" startY="223" marked="true" color="-1" endY="298" startX="164" filled="true" />
+      <polygon color="-1" filled="true" marked="true">
+        <point x="45" y="285" />
+        <point x="30" y="285" />
+        <point x="30" y="240" />
+        <point x="15" y="195" />
+        <point x="45" y="210" />
+      </polygon>
+      <circle x="3" y="83" marked="true" color="-1" diameter="150" filled="true" />
+      <rectangle endX="80" startY="221" marked="true" color="-1" endY="296" startX="65" filled="true" />
+      <polygon color="-1" filled="true" marked="true">
+        <point x="195" y="285" />
+        <point x="210" y="285" />
+        <point x="210" y="240" />
+        <point x="240" y="210" />
+        <point x="195" y="210" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="276" y="85" />
+        <point x="285" y="105" />
+        <point x="302" y="99" />
+        <point x="294" y="83" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="false">
+        <point x="219" y="85" />
+        <point x="210" y="105" />
+        <point x="193" y="99" />
+        <point x="201" y="83" />
+      </polygon>
+    </shape>
+    <shape name="square" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true" />
+    </shape>
+    <shape name="square 2" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true" />
+      <rectangle endX="240" startY="60" marked="false" color="255" endY="240" startX="60" filled="true" />
+    </shape>
+    <shape name="star" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="151" y="1" />
+        <point x="185" y="108" />
+        <point x="298" y="108" />
+        <point x="207" y="175" />
+        <point x="242" y="282" />
+        <point x="151" y="216" />
+        <point x="59" y="282" />
+        <point x="94" y="175" />
+        <point x="3" y="108" />
+        <point x="116" y="108" />
+      </polygon>
+    </shape>
+    <shape name="target" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true" />
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true" />
+      <circle x="60" y="60" marked="true" color="-1920102913" diameter="180" filled="true" />
+      <circle x="90" y="90" marked="false" color="255" diameter="120" filled="true" />
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true" />
+    </shape>
+    <shape name="tree" rotatable="false" editableColorIndex="0">
+      <circle x="118" y="3" marked="true" color="-1920102913" diameter="94" filled="true" />
+      <rectangle endX="180" startY="195" marked="false" color="-1653716737" endY="300" startX="120" filled="true" />
+      <circle x="65" y="21" marked="true" color="-1920102913" diameter="108" filled="true" />
+      <circle x="116" y="41" marked="true" color="-1920102913" diameter="127" filled="true" />
+      <circle x="45" y="90" marked="true" color="-1920102913" diameter="120" filled="true" />
+      <circle x="104" y="74" marked="true" color="-1920102913" diameter="152" filled="true" />
+    </shape>
+    <shape name="triangle" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30" />
+        <point x="15" y="255" />
+        <point x="285" y="255" />
+      </polygon>
+    </shape>
+    <shape name="triangle 2" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30" />
+        <point x="15" y="255" />
+        <point x="285" y="255" />
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="151" y="99" />
+        <point x="225" y="223" />
+        <point x="75" y="224" />
+      </polygon>
+    </shape>
+    <shape name="truck" rotatable="false" editableColorIndex="0">
+      <rectangle endX="195" startY="45" marked="true" color="-1920102913" endY="187" startX="4" filled="true" />
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="296" y="193" />
+        <point x="296" y="150" />
+        <point x="259" y="134" />
+        <point x="244" y="104" />
+        <point x="208" y="104" />
+        <point x="207" y="194" />
+      </polygon>
+      <rectangle endX="195" startY="60" marked="false" color="-1" endY="105" startX="195" filled="true" />
+      <polygon color="255" filled="true" marked="false">
+        <point x="238" y="112" />
+        <point x="252" y="141" />
+        <point x="219" y="141" />
+        <point x="218" y="112" />
+      </polygon>
+      <circle x="234" y="174" marked="false" color="255" diameter="42" filled="true" />
+      <rectangle endX="214" startY="185" marked="true" color="-1920102913" endY="194" startX="181" filled="true" />
+      <circle x="144" y="174" marked="false" color="255" diameter="42" filled="true" />
+      <circle x="24" y="174" marked="false" color="255" diameter="42" filled="true" />
+      <circle x="24" y="174" marked="true" color="-1920102913" diameter="42" filled="false" />
+      <circle x="144" y="174" marked="true" color="-1920102913" diameter="42" filled="false" />
+      <circle x="234" y="174" marked="true" color="-1920102913" diameter="42" filled="false" />
+    </shape>
+    <shape name="turtle" rotatable="true" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="215" y="204" />
+        <point x="240" y="233" />
+        <point x="246" y="254" />
+        <point x="228" y="266" />
+        <point x="215" y="252" />
+        <point x="193" y="210" />
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="195" y="90" />
+        <point x="225" y="75" />
+        <point x="245" y="75" />
+        <point x="260" y="89" />
+        <point x="269" y="108" />
+        <point x="261" y="124" />
+        <point x="240" y="105" />
+        <point x="225" y="105" />
+        <point x="210" y="105" />
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="105" y="90" />
+        <point x="75" y="75" />
+        <point x="55" y="75" />
+        <point x="40" y="89" />
+        <point x="31" y="108" />
+        <point x="39" y="124" />
+        <point x="60" y="105" />
+        <point x="75" y="105" />
+        <point x="90" y="105" />
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="132" y="85" />
+        <point x="134" y="64" />
+        <point x="107" y="51" />
+        <point x="108" y="17" />
+        <point x="150" y="2" />
+        <point x="192" y="18" />
+        <point x="192" y="52" />
+        <point x="169" y="65" />
+        <point x="172" y="87" />
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="85" y="204" />
+        <point x="60" y="233" />
+        <point x="54" y="254" />
+        <point x="72" y="266" />
+        <point x="85" y="252" />
+        <point x="107" y="210" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="119" y="75" />
+        <point x="179" y="75" />
+        <point x="209" y="101" />
+        <point x="224" y="135" />
+        <point x="220" y="225" />
+        <point x="175" y="261" />
+        <point x="128" y="261" />
+        <point x="81" y="224" />
+        <point x="74" y="135" />
+        <point x="88" y="99" />
+      </polygon>
+    </shape>
+    <shape name="wheel" rotatable="false" editableColorIndex="0">
+      <circle x="3" y="3" marked="true" color="-1920102913" diameter="294" filled="true" />
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true" />
+      <line endX="150" startY="285" marked="true" color="-1920102913" endY="15" startX="150" />
+      <line endX="285" startY="150" marked="true" color="-1920102913" endY="150" startX="15" />
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true" />
+      <line endX="79" startY="40" marked="true" color="-1920102913" endY="269" startX="216" />
+      <line endX="269" startY="84" marked="true" color="-1920102913" endY="221" startX="40" />
+      <line endX="269" startY="216" marked="true" color="-1920102913" endY="79" startX="40" />
+      <line endX="221" startY="40" marked="true" color="-1920102913" endY="269" startX="84" />
+    </shape>
+    <shape name="wolf" rotatable="false" editableColorIndex="0">
+      <polygon color="255" filled="true" marked="false">
+        <point x="253" y="133" />
+        <point x="245" y="131" />
+        <point x="245" y="133" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="2" y="194" />
+        <point x="13" y="197" />
+        <point x="30" y="191" />
+        <point x="38" y="193" />
+        <point x="38" y="205" />
+        <point x="20" y="226" />
+        <point x="20" y="257" />
+        <point x="27" y="265" />
+        <point x="38" y="266" />
+        <point x="40" y="260" />
+        <point x="31" y="253" />
+        <point x="31" y="230" />
+        <point x="60" y="206" />
+        <point x="68" y="198" />
+        <point x="75" y="209" />
+        <point x="66" y="228" />
+        <point x="65" y="243" />
+        <point x="82" y="261" />
+        <point x="84" y="268" />
+        <point x="100" y="267" />
+        <point x="103" y="261" />
+        <point x="77" y="239" />
+        <point x="79" y="231" />
+        <point x="100" y="207" />
+        <point x="98" y="196" />
+        <point x="119" y="201" />
+        <point x="143" y="202" />
+        <point x="160" y="195" />
+        <point x="166" y="210" />
+        <point x="172" y="213" />
+        <point x="173" y="238" />
+        <point x="167" y="251" />
+        <point x="160" y="248" />
+        <point x="154" y="265" />
+        <point x="169" y="264" />
+        <point x="178" y="247" />
+        <point x="186" y="240" />
+        <point x="198" y="260" />
+        <point x="200" y="271" />
+        <point x="217" y="271" />
+        <point x="219" y="262" />
+        <point x="207" y="258" />
+        <point x="195" y="230" />
+        <point x="192" y="198" />
+        <point x="210" y="184" />
+        <point x="227" y="164" />
+        <point x="242" y="144" />
+        <point x="259" y="145" />
+        <point x="284" y="151" />
+        <point x="277" y="141" />
+        <point x="293" y="140" />
+        <point x="299" y="134" />
+        <point x="297" y="127" />
+        <point x="273" y="119" />
+        <point x="270" y="105" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="-1" y="195" />
+        <point x="14" y="180" />
+        <point x="36" y="166" />
+        <point x="40" y="153" />
+        <point x="53" y="140" />
+        <point x="82" y="131" />
+        <point x="134" y="133" />
+        <point x="159" y="126" />
+        <point x="188" y="115" />
+        <point x="227" y="108" />
+        <point x="236" y="102" />
+        <point x="238" y="98" />
+        <point x="268" y="86" />
+        <point x="269" y="92" />
+        <point x="281" y="87" />
+        <point x="269" y="103" />
+        <point x="269" y="113" />
+      </polygon>
+    </shape>
+    <shape name="x" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="270" y="75" />
+        <point x="225" y="30" />
+        <point x="30" y="225" />
+        <point x="75" y="270" />
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="75" />
+        <point x="75" y="30" />
+        <point x="270" y="225" />
+        <point x="225" y="270" />
+      </polygon>
+    </shape>
+  </turtleShapes>
+  <linkShapes>
+    <shape name="default" curviness="0.0">
+      <lines>
+        <line x="-0.2" visible="false">
+          <dash value="0.0" />
+          <dash value="1.0" />
+        </line>
+        <line x="0.0" visible="true">
+          <dash value="1.0" />
+          <dash value="0.0" />
+        </line>
+        <line x="0.2" visible="false">
+          <dash value="0.0" />
+          <dash value="1.0" />
+        </line>
+      </lines>
+      <indicator>
+        <shape name="link direction" rotatable="true" editableColorIndex="0">
+          <line endX="90" startY="150" marked="true" color="-1920102913" endY="180" startX="150" />
+          <line endX="210" startY="150" marked="true" color="-1920102913" endY="180" startX="150" />
+        </shape>
+      </indicator>
+    </shape>
+  </linkShapes>
+  <previewCommands>setup repeat 75 [ go ]</previewCommands>
+  <experiments>
+    <experiment name="1-fail" repetitions="30" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition>done? or ticks &gt;= 10000</exitCondition>
+      <metrics>
+        <metric>ticks</metric>
+        <metric>done?</metric>
+        <metric>current-phase</metric>
+        <metric>ticks-to-success</metric>
+        <metric>holding-time</metric>
+        <metric>sheep-in-zone</metric>
+        <metric>sheep-captured-count</metric>
+        <metric>dogs-distance</metric>
+        <metric>lost-sheep</metric>
+        <metric>flock-spreadness</metric>
+        <metric>mean-spreadness</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="nb-sheep">
+          <value value="50" />
+          <value value="100" />
+          <value value="150" />
+          <value value="200" />
+          <value value="250" />
+          <value value="300" />
+          <value value="400" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="nb-dogs">
+          <value value="1" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="n-topological">
+          <value value="7" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="W-global-cohesion">
+          <value value="1.5" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="R-repulsion">
+          <value value="2" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="W-neigh-fleeing-cohesion">
+          <value value="2" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="W-neigh-grazing-cohesion">
+          <value value="0.5" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="vision-range">
+          <value value="30" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="see-centroid">
+          <value value="false" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="use-density-gradient?">
+          <value value="true" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="with-exit?">
+          <value value="true" />
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="2-fail" repetitions="30" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition>done? or ticks &gt;= 10000</exitCondition>
+      <metrics>
+        <metric>ticks</metric>
+        <metric>done?</metric>
+        <metric>current-phase</metric>
+        <metric>ticks-to-success</metric>
+        <metric>holding-time</metric>
+        <metric>sheep-in-zone</metric>
+        <metric>sheep-captured-count</metric>
+        <metric>dogs-distance</metric>
+        <metric>lost-sheep</metric>
+        <metric>flock-spreadness</metric>
+        <metric>mean-spreadness</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="nb-sheep">
+          <value value="50" />
+          <value value="100" />
+          <value value="150" />
+          <value value="200" />
+          <value value="250" />
+          <value value="300" />
+          <value value="400" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="nb-dogs">
+          <value value="2" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="n-topological">
+          <value value="7" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="W-global-cohesion">
+          <value value="0.75" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="R-repulsion">
+          <value value="3" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="W-neigh-fleeing-cohesion">
+          <value value="1.5" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="W-neigh-grazing-cohesion">
+          <value value="0.5" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="vision-range">
+          <value value="30" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="see-centroid">
+          <value value="false" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="use-density-gradient?">
+          <value value="true" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="with-exit?">
+          <value value="true" />
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="3-fail" repetitions="30" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition>done? or ticks &gt;= 10000</exitCondition>
+      <metrics>
+        <metric>ticks</metric>
+        <metric>done?</metric>
+        <metric>current-phase</metric>
+        <metric>ticks-to-success</metric>
+        <metric>holding-time</metric>
+        <metric>sheep-in-zone</metric>
+        <metric>sheep-captured-count</metric>
+        <metric>dogs-distance</metric>
+        <metric>lost-sheep</metric>
+        <metric>flock-spreadness</metric>
+        <metric>mean-spreadness</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="nb-sheep">
+          <value value="50" />
+          <value value="100" />
+          <value value="150" />
+          <value value="200" />
+          <value value="250" />
+          <value value="300" />
+          <value value="400" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="nb-dogs">
+          <value value="3" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="n-topological">
+          <value value="7" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="W-global-cohesion">
+          <value value="0.75" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="R-repulsion">
+          <value value="3" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="W-neigh-fleeing-cohesion">
+          <value value="1.5" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="W-neigh-grazing-cohesion">
+          <value value="0.5" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="vision-range">
+          <value value="30" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="see-centroid">
+          <value value="false" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="use-density-gradient?">
+          <value value="true" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="with-exit?">
+          <value value="true" />
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="4-fail" repetitions="30" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition>done? or ticks &gt;= 10000</exitCondition>
+      <metrics>
+        <metric>ticks</metric>
+        <metric>done?</metric>
+        <metric>current-phase</metric>
+        <metric>ticks-to-success</metric>
+        <metric>holding-time</metric>
+        <metric>sheep-in-zone</metric>
+        <metric>sheep-captured-count</metric>
+        <metric>dogs-distance</metric>
+        <metric>lost-sheep</metric>
+        <metric>flock-spreadness</metric>
+        <metric>mean-spreadness</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="nb-sheep">
+          <value value="50" />
+          <value value="100" />
+          <value value="150" />
+          <value value="200" />
+          <value value="250" />
+          <value value="300" />
+          <value value="400" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="nb-dogs">
+          <value value="4" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="n-topological">
+          <value value="7" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="W-global-cohesion">
+          <value value="0.75" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="R-repulsion">
+          <value value="3" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="W-neigh-fleeing-cohesion">
+          <value value="1.5" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="W-neigh-grazing-cohesion">
+          <value value="0.5" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="vision-range">
+          <value value="30" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="see-centroid">
+          <value value="false" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="use-density-gradient?">
+          <value value="true" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="with-exit?">
+          <value value="true" />
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="5-6-fails" repetitions="30" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition>done? or ticks &gt;= 10000</exitCondition>
+      <metrics>
+        <metric>ticks</metric>
+        <metric>done?</metric>
+        <metric>current-phase</metric>
+        <metric>ticks-to-success</metric>
+        <metric>holding-time</metric>
+        <metric>sheep-in-zone</metric>
+        <metric>sheep-captured-count</metric>
+        <metric>dogs-distance</metric>
+        <metric>lost-sheep</metric>
+        <metric>flock-spreadness</metric>
+        <metric>mean-spreadness</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="nb-sheep">
+          <value value="250" />
+          <value value="300" />
+          <value value="400" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="nb-dogs">
+          <value value="5" />
+          <value value="6" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="n-topological">
+          <value value="7" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="W-global-cohesion">
+          <value value="0.75" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="R-repulsion">
+          <value value="3" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="W-neigh-fleeing-cohesion">
+          <value value="1.5" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="W-neigh-grazing-cohesion">
+          <value value="0.5" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="vision-range">
+          <value value="30" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="see-centroid">
+          <value value="false" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="use-density-gradient?">
+          <value value="true" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="with-exit?">
+          <value value="true" />
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="all-fail" repetitions="70" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition>done? or ticks &gt;= 10000</exitCondition>
+      <metrics>
+        <metric>ticks</metric>
+        <metric>done?</metric>
+        <metric>current-phase</metric>
+        <metric>ticks-to-success</metric>
+        <metric>holding-time</metric>
+        <metric>sheep-in-zone</metric>
+        <metric>sheep-captured-count</metric>
+        <metric>dogs-distance</metric>
+        <metric>lost-sheep</metric>
+        <metric>flock-spreadness</metric>
+        <metric>mean-spreadness</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="nb-sheep">
+          <value value="50" />
+          <value value="100" />
+          <value value="150" />
+          <value value="200" />
+          <value value="250" />
+          <value value="300" />
+          <value value="400" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="nb-dogs">
+          <value value="1" />
+          <value value="2" />
+          <value value="3" />
+          <value value="4" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="n-topological">
+          <value value="7" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="W-global-cohesion">
+          <value value="0.75" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="R-repulsion">
+          <value value="3" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="W-neigh-fleeing-cohesion">
+          <value value="1.5" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="W-neigh-grazing-cohesion">
+          <value value="0.5" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="vision-range">
+          <value value="30" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="see-centroid">
+          <value value="false" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="use-density-gradient?">
+          <value value="true" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="with-exit?">
+          <value value="true" />
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="ok_300_400" repetitions="100" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition>done? or ticks &gt;= 10000</exitCondition>
+      <metrics>
+        <metric>ticks</metric>
+        <metric>done?</metric>
+        <metric>current-phase</metric>
+        <metric>ticks-to-success</metric>
+        <metric>holding-time</metric>
+        <metric>sheep-in-zone</metric>
+        <metric>sheep-captured-count</metric>
+        <metric>dogs-distance</metric>
+        <metric>lost-sheep</metric>
+        <metric>flock-spreadness</metric>
+        <metric>mean-spreadness</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="nb-sheep">
+          <value value="50" />
+          <value value="100" />
+          <value value="150" />
+          <value value="200" />
+          <value value="250" />
+          <value value="300" />
+          <value value="400" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="nb-dogs">
+          <value value="6" />
+          <value value="10" />
+          <value value="15" />
+          <value value="20" />
+          <value value="25" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="n-topological">
+          <value value="7" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="W-global-cohesion">
+          <value value="0.75" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="R-repulsion">
+          <value value="3" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="W-neigh-fleeing-cohesion">
+          <value value="1.5" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="W-neigh-grazing-cohesion">
+          <value value="0.5" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="vision-range">
+          <value value="30" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="see-centroid">
+          <value value="false" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="use-density-gradient?">
+          <value value="true" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="with-exit?">
+          <value value="true" />
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="5_30" repetitions="100" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition>done? or ticks &gt;= 10000</exitCondition>
+      <metrics>
+        <metric>ticks</metric>
+        <metric>done?</metric>
+        <metric>current-phase</metric>
+        <metric>ticks-to-success</metric>
+        <metric>holding-time</metric>
+        <metric>sheep-in-zone</metric>
+        <metric>sheep-captured-count</metric>
+        <metric>dogs-distance</metric>
+        <metric>lost-sheep</metric>
+        <metric>flock-spreadness</metric>
+        <metric>mean-spreadness</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="nb-sheep">
+          <value value="50" />
+          <value value="100" />
+          <value value="150" />
+          <value value="200" />
+          <value value="250" />
+          <value value="300" />
+          <value value="400" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="nb-dogs">
+          <value value="5" />
+          <value value="30" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="n-topological">
+          <value value="7" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="W-global-cohesion">
+          <value value="0.75" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="R-repulsion">
+          <value value="3" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="W-neigh-fleeing-cohesion">
+          <value value="1.5" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="W-neigh-grazing-cohesion">
+          <value value="0.5" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="vision-range">
+          <value value="30" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="see-centroid">
+          <value value="false" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="use-density-gradient?">
+          <value value="true" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="with-exit?">
+          <value value="true" />
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="350_sheep" repetitions="100" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition>done? or ticks &gt;= 10000</exitCondition>
+      <metrics>
+        <metric>ticks</metric>
+        <metric>done?</metric>
+        <metric>current-phase</metric>
+        <metric>ticks-to-success</metric>
+        <metric>holding-time</metric>
+        <metric>sheep-in-zone</metric>
+        <metric>sheep-captured-count</metric>
+        <metric>dogs-distance</metric>
+        <metric>lost-sheep</metric>
+        <metric>flock-spreadness</metric>
+        <metric>mean-spreadness</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="nb-sheep">
+          <value value="350" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="nb-dogs">
+          <value value="1" />
+          <value value="2" />
+          <value value="3" />
+          <value value="4" />
+          <value value="5" />
+          <value value="6" />
+          <value value="10" />
+          <value value="15" />
+          <value value="20" />
+          <value value="25" />
+          <value value="30" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="n-topological">
+          <value value="7" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="W-global-cohesion">
+          <value value="0.75" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="R-repulsion">
+          <value value="3" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="W-neigh-fleeing-cohesion">
+          <value value="1.5" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="W-neigh-grazing-cohesion">
+          <value value="0.5" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="vision-range">
+          <value value="30" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="see-centroid">
+          <value value="false" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="use-density-gradient?">
+          <value value="true" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="with-exit?">
+          <value value="true" />
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="400_sheep_35" repetitions="100" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition>done? or ticks &gt;= 10000</exitCondition>
+      <metrics>
+        <metric>ticks</metric>
+        <metric>done?</metric>
+        <metric>current-phase</metric>
+        <metric>ticks-to-success</metric>
+        <metric>holding-time</metric>
+        <metric>sheep-in-zone</metric>
+        <metric>sheep-captured-count</metric>
+        <metric>dogs-distance</metric>
+        <metric>lost-sheep</metric>
+        <metric>flock-spreadness</metric>
+        <metric>mean-spreadness</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="nb-sheep">
+          <value value="400" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="nb-dogs">
+          <value value="35" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="n-topological">
+          <value value="7" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="W-global-cohesion">
+          <value value="0.75" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="R-repulsion">
+          <value value="3" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="W-neigh-fleeing-cohesion">
+          <value value="1.5" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="W-neigh-grazing-cohesion">
+          <value value="0.5" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="vision-range">
+          <value value="30" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="see-centroid">
+          <value value="false" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="use-density-gradient?">
+          <value value="true" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="with-exit?">
+          <value value="true" />
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+    <experiment name="35_all_minus_400" repetitions="100" sequentialRunOrder="true" runMetricsEveryStep="false">
+      <setup>setup</setup>
+      <go>go</go>
+      <exitCondition>done? or ticks &gt;= 10000</exitCondition>
+      <metrics>
+        <metric>ticks</metric>
+        <metric>done?</metric>
+        <metric>current-phase</metric>
+        <metric>ticks-to-success</metric>
+        <metric>holding-time</metric>
+        <metric>sheep-in-zone</metric>
+        <metric>sheep-captured-count</metric>
+        <metric>dogs-distance</metric>
+        <metric>lost-sheep</metric>
+        <metric>flock-spreadness</metric>
+        <metric>mean-spreadness</metric>
+      </metrics>
+      <constants>
+        <enumeratedValueSet variable="nb-sheep">
+          <value value="50" />
+          <value value="100" />
+          <value value="150" />
+          <value value="200" />
+          <value value="250" />
+          <value value="300" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="nb-dogs">
+          <value value="35" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="n-topological">
+          <value value="7" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="W-global-cohesion">
+          <value value="0.75" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="R-repulsion">
+          <value value="3" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="W-neigh-fleeing-cohesion">
+          <value value="1.5" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="W-neigh-grazing-cohesion">
+          <value value="0.5" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="vision-range">
+          <value value="30" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="see-centroid">
+          <value value="false" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="use-density-gradient?">
+          <value value="true" />
+        </enumeratedValueSet>
+        <enumeratedValueSet variable="with-exit?">
+          <value value="true" />
+        </enumeratedValueSet>
+      </constants>
+    </experiment>
+  </experiments>
+</model>

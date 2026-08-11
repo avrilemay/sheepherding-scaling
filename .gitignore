@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# IDE
+.idea/
+.vscode/
+
+# MS Office lock files
+~$*
+
+# Raw BehaviorSpace / gradient logs (regenerable, ~400 MB)
+gradient_D*_N*.csv
